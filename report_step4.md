@@ -63,3 +63,5 @@ curl -x http://127.0.0.1:8080 http://www.0thomas1.com
 ```
 ![502_bad_gateway](./result/4_502_bad_gateway.png)
 
+## Multi-threading
+The proxy server can handle multiple requests simultaneously by using multithreading. Each incoming request is handled in a separate thread, allowing the proxy server to process multiple requests concurrently. This improves performance by distributing the requests across multiple threads.
