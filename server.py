@@ -7,6 +7,7 @@ from pathlib import Path
 from hashlib import md5
 from datetime import timezone
 import mimetypes
+import proxy_util
 
 HOST = "127.0.0.1"
 PORT = 18080  # use 8080 if available on your machine
@@ -242,7 +243,7 @@ def main():
     try:
         while True:
             client_socket, addr = server_socket.accept()
-            handle_client(client_socket, addr)
+            proxy_util.handle_proxy_client(client_socket, addr)
     except KeyboardInterrupt:
         print("\nShutting down.")
     finally:
