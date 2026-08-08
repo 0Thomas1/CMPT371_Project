@@ -6,9 +6,11 @@ from dataclasses import dataclass
 from hashlib import sha256
 from socket import AF_INET, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR, create_connection, socket
 import threading
+from typing import Iterator
 from urllib.parse import urlparse
 from pathlib import Path
 import time
+import queue
 CACHE_MAX_AGE_SECONDS = 300
 
 
@@ -48,6 +50,36 @@ STATUS_TEXT = {
 	505: "HTTP Version Not Supported",
 }
 
+class ClientSession:
+    def __init__(self, client_socket, frame_generator):
+        self.socket = client_socket
+        self.generator = frame_generator
+
+def frame_worker(session_queue: queue.Queue):
+    """Worker thread that processes one frame per client in round-robin fashion."""
+    while True:
+        # 1. Get the next client in line (blocks until a client is available)
+        session = session_queue.get()
+        
+        try:
+            # 2. Extract exactly ONE frame
+            frame = next(session.generator)
+            
+            # 3. Send the frame to the client
+            session.socket.sendall(frame)
+            
+            # 4. Put the client back at the end of the line for their next turn
+            session_queue.put(session)
+            
+        except StopIteration:
+            # The generator is empty; the response is fully sent.
+            session.socket.close()
+        except OSError:
+            # The client disconnected unexpectedly.
+            session.socket.close()
+        finally:
+            # Notify the queue that this specific task is done
+            session_queue.task_done()
 
 def build_response(status: int, body: str | bytes = b"", extra_headers: list[str] | None = None) -> bytes:
 	if isinstance(body, str):
@@ -202,9 +234,7 @@ def fetch_and_cache_response(target: str) -> bytes | None:
 		path.write_bytes(raw_response)
 		print(f"Cached response for {target} at {path}")
 	return raw_response
-
-
-def serve_cached_response(target: str, client_socket) -> bool:
+def serve_cached_response(target: str, client_socket, session_queue: queue.Queue) -> bool:
 	path = cache_path_for_target(target)
 	if path is None:
 		return False
@@ -216,8 +246,13 @@ def serve_cached_response(target: str, client_socket) -> bool:
 			raw_response = refreshed_response
 
 	print(f"Serving cached response for {target} from {path}")
-	client_socket.sendall(raw_response)
-	return True
+	generator = frame_generator(raw_response)
+	if generator:
+		session_queue.put(ClientSession(client_socket, frame_generator(raw_response)))
+		return True
+	else:
+		client_socket.close()
+		return False
 
 
 def header_value(headers: list[tuple[str, str]], name: str) -> str | None:
@@ -268,7 +303,8 @@ def build_forward_request(request: HttpRequest) -> bytes:
 	return (request_line + "\r\n" + header_block + "\r\n\r\n").encode("latin-1") + request.body
 
 
-def forward_request(request: HttpRequest, client_socket) -> None:
+
+def forward_request(request: HttpRequest, client_socket, session_queue: queue.Queue) -> None:
 	host, port, _ = parse_absolute_target(request.target)
 	upstream_request = build_forward_request(request)
 	try:
@@ -288,7 +324,11 @@ def forward_request(request: HttpRequest, client_socket) -> None:
 				cache_file.write_bytes(raw_response)
 				print(f"Cached response for {request.target} at {cache_file}")
 
-			client_socket.sendall(raw_response)
+			generator = frame_generator(raw_response)
+			if generator:
+				session_queue.put(ClientSession(client_socket, generator))
+			else:
+				client_socket.close()
 	except OSError as exc:
 		response = build_response(
 			502,
@@ -296,8 +336,13 @@ def forward_request(request: HttpRequest, client_socket) -> None:
 		)
 		client_socket.sendall(response)
 
+def frame_generator(data: bytes, chunk_size: int = 1024) -> Iterator[bytes]:
+	for i in range(0, len(data), chunk_size):
+		yield data[i:i + chunk_size]
 
-def handle_proxy_client(client_socket, addr) -> None:
+
+
+def handle_proxy_client(client_socket, addr,session_queue) -> None:
 	try:
 		raw_request = read_http_message(client_socket)
 		print(f"Connection from {addr}")
@@ -326,22 +371,23 @@ def handle_proxy_client(client_socket, addr) -> None:
 			)
 			return
 
-		if serve_cached_response(request.target, client_socket):
+		if serve_cached_response(request.target, client_socket,session_queue):
 			return
 
 		try:
-			parse_absolute_target(request.target)
+			parse_absolute_target(request.target )
 		except ValueError as exc:
 			client_socket.sendall(build_response(400, html_page(BAD_REQUEST_TITLE, str(exc))))
 			return
 
-		forward_request(request, client_socket)
+		forward_request(request, client_socket,session_queue)
 	except ValueError as exc:
 		client_socket.sendall(build_response(400, html_page(BAD_REQUEST_TITLE, str(exc))))
+		client_socket.close()
 	except OSError as exc:
 		client_socket.sendall(build_response(500, html_page("500 Internal Server Error", str(exc))))
-	finally:
 		client_socket.close()
+	
 
 
 def serve(host: str, port: int) -> None:
@@ -350,13 +396,16 @@ def serve(host: str, port: int) -> None:
 	server_socket.bind((host, port))
 	server_socket.listen(5)
 	print(f"Proxy server is running on http://{host}:{port}", flush=True)
+	session_queue = queue.Queue()
 
+	for _ in range(4):
+		threading.Thread(target=frame_worker, args=(session_queue,), daemon=True).start()
 	try:
 		while True:
 			client_socket, addr = server_socket.accept()
 			threading.Thread(
 				target=handle_proxy_client,
-				args=(client_socket, addr),
+				args=(client_socket, addr, session_queue),
 				daemon=True,
 			).start()
 	except KeyboardInterrupt:
